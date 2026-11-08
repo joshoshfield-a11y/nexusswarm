@@ -21,6 +21,9 @@ that does not exist outside Canvas.
 
 ## Source
 
-`nexusswarm-suite-v4.tsx` is the verified source (73,722 B,
-sha256 `479584ba69781bbfda4f73db241ee7e0751ba54f51c489ade4badd9f4093fd69`).
+`nexusswarm-suite-v5.tsx` is the verified source (81,542 B,
+sha256 `25f064a7c83c4c7399abc693ec410116ccd9e2b20829d056a918bfed6d56f229`).
 `bundle.js` is the built output of that file; `index.html` mounts it.
+v5 adds sandboxed JavaScript code execution: agents can run a `.js`
+workspace file through an `executions` field, and the Workspace tab has
+a Run button plus a RUN OUTPUT panel (Web Worker runner, 5s timeout).
