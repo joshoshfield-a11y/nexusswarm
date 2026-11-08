@@ -19417,6 +19417,18 @@ var RESPONSE_SCHEMA = {
         required: ["op", "path"]
       }
     },
+    executions: {
+      type: "ARRAY",
+      description: "Optional: JavaScript workspace files to execute in the sandboxed runner after file_operations. Results (console output, errors, timeouts) are returned in the chat log and fed into the next turn.",
+      items: {
+        type: "OBJECT",
+        properties: {
+          file: { type: "STRING", description: "Path of a .js file already in the workspace, e.g. '/src/hello.js'. Only .js files can run in v5." },
+          timeout_ms: { type: "NUMBER", description: "Optional run timeout in milliseconds, default 5000, max 30000." }
+        },
+        required: ["file"]
+      }
+    },
     confidence: { type: "NUMBER", description: "Confidence score 0.0-1.0" }
   },
   required: ["thoughts", "action", "message"]
@@ -19436,6 +19448,7 @@ function App() {
   const [selectedFilePath, setSelectedFilePath] = import_react.useState(null);
   const [fileContentEdit, setFileContentEdit] = import_react.useState("");
   const [newFilePathInput, setNewFilePathInput] = import_react.useState("");
+  const [runOutput, setRunOutput] = import_react.useState("");
   const multiFileInputRef = import_react.useRef(null);
   const refreshVFS = import_react.useCallback(async () => {
     try {
@@ -19534,6 +19547,14 @@ function App() {
     await fsDB.write(selectedFilePath, fileContentEdit);
     await refreshVFS();
     showToast(`Saved ${selectedFilePath}`);
+  };
+  const handleRunVFSFile = async (path) => {
+    const target = path || selectedFilePath;
+    if (!target)
+      return;
+    setRunOutput("⏳ Running " + target + " ...");
+    const line = await executeCodeInSandbox(target);
+    setRunOutput(line);
   };
   const handleDeleteVFSFile = async (path) => {
     if (window.confirm(`Delete ${path}?`)) {
@@ -19701,6 +19722,111 @@ ${listStr || "(empty)"}`);
     await refreshVFS();
     return results;
   };
+  const executeCodeInSandbox = async (filePath, timeoutMs) => {
+    const target = (filePath || "").toString().trim();
+    if (!target.endsWith(".js")) {
+      return `[RUN REJECTED] ${target}: only .js workspace files can run in v5 — Python and other languages need a runtime that is not installed yet`;
+    }
+    const path = target.startsWith("/") ? target : "/" + target;
+    const all = await fsDB.getAll();
+    const found = all.find((f) => f.path === path);
+    if (!found) {
+      return `[RUN ERROR] ${path}: file not found in workspace`;
+    }
+    const timeout = Math.min(Math.max(Number(timeoutMs) || 5000, 500), 30000);
+    const code = String(found.content ?? "");
+    const start = performance.now();
+    return new Promise((resolve) => {
+      let worker;
+      let url;
+      try {
+        const script = `(function () {
+  var __out = [];
+  var __fmt = function (v) { try { return typeof v === 'string' ? v : JSON.stringify(v); } catch (e) { return String(v); } };
+  console.log = function () { __out.push(Array.prototype.map.call(arguments, __fmt).join(' ')); };
+  console.error = function () { __out.push('ERROR: ' + Array.prototype.map.call(arguments, __fmt).join(' ')); };
+  var __error = null;
+  try {
+${code}
+  } catch (e) {
+    __error = (e && e.message) ? (e.name ? e.name + ': ' + e.message : e.message) : String(e);
+  }
+  self.postMessage({ __nexusRun: true, output: __out.join('\\n'), error: __error });
+})();
+`;
+        url = URL.createObjectURL(new Blob([script], { type: "text/javascript" }));
+        worker = new Worker(url);
+      } catch (err) {
+        resolve(`[RUN ERROR] ${path}: sandboxed worker could not start in this environment (${err.message})`);
+        return;
+      }
+      let settled = false;
+      const finish = (line) => {
+        if (settled)
+          return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          worker.terminate();
+        } catch (e) {}
+        if (url)
+          URL.revokeObjectURL(url);
+        resolve(line);
+      };
+      const timer = setTimeout(() => {
+        finish(`[RUN TIMEOUT] ${path} after ${timeout}ms — the run was stopped (v5 runs synchronous code only; long loops are cut off)`);
+      }, timeout);
+      worker.onmessage = (event) => {
+        const data = event.data;
+        if (!data || data.__nexusRun !== true)
+          return;
+        const ms = Math.round(performance.now() - start);
+        const out = (data.output || "").trim();
+        if (data.error) {
+          finish(`[RUN ERROR] ${path}: ${data.error}${out ? `
+` + out : ""}`);
+        } else {
+          finish(`[RUN SUCCESS] ${path} (${ms}ms):
+${out || "(no output)"}`);
+        }
+      };
+      worker.onerror = (event) => {
+        const msg = event && event.message ? event.message : "worker error";
+        finish(`[RUN ERROR] ${path}: ${msg}`);
+      };
+    });
+  };
+  const executeCodeExecutions = async (agentName, rawExecutions) => {
+    let executions = rawExecutions;
+    if (typeof executions === "string") {
+      try {
+        executions = JSON.parse(executions);
+      } catch {
+        executions = [];
+      }
+    }
+    if (!Array.isArray(executions) || executions.length === 0)
+      return [];
+    const results = [];
+    for (let item of executions) {
+      if (!item)
+        continue;
+      if (typeof item === "string") {
+        try {
+          item = JSON.parse(item);
+        } catch {
+          continue;
+        }
+      }
+      const file = (item.file || item.path || "").toString().trim();
+      if (!file) {
+        results.push('[RUN REJECTED] execution requested with no file — executions need {"file": "/src/name.js"}');
+        continue;
+      }
+      results.push(await executeCodeInSandbox(file, item.timeout_ms || item.timeout));
+    }
+    return results;
+  };
   const toggleAgent = import_react.useCallback((id) => {
     setAgents((prev) => prev.map((a) => a.id === id ? { ...a, active: !a.active } : a));
   }, []);
@@ -19800,11 +19926,20 @@ RULES:
 - "path" must be ONLY the file path (e.g. "/src/hello.py"). Never put code, flags, or descriptions in the path.
 - To read a file back, use {"op": "read", "path": "/src/hello.py"} and quote the returned contents exactly — never quote file contents from memory.
 
+CODE EXECUTION (v5 — JavaScript only):
+- After writing a .js file, you can run it in a sandboxed runner with the "executions" array in your JSON output.
+- Exact shape: {"file": "/src/hello.js", "timeout_ms": 5000}
+- The runner is a sandboxed Web Worker: no DOM access, no access to the app or the workspace store, no network allowlist yet, and it runs on its own thread so a hung run cannot freeze the app. It captures console.log / console.error output and thrown errors, and stops the run at the timeout.
+- Runs are synchronous: code after the first await or setTimeout does not produce output. Keep verification scripts synchronous.
+- Only .js files already in the workspace can run. Python and other languages cannot run in v5 — do not request them.
+- Quote run results exactly from the returned log lines — never claim a run result you did not see in the log.
+
 CRITICAL BEHAVIORAL MANDATES:
 1. EXHAUSTIVE DETAIL: Provide deep, production-ready, highly granular code modules or analysis.
 2. IMMUTABLE CHRONICLE APPENDING: The shared Canvas is an immutable chronicle. Action "edit" appends to the canvas.
 3. WORKSPACE MANAGEMENT: Leverage "file_operations" freely to write full modular files to the workspace filesystem — every write op MUST include the full file contents in "content".
-4. ACTION SELECTION: Choose "chat" to discuss, or "edit" to append to the canvas.`;
+4. ACTION SELECTION: Choose "chat" to discuss, or "edit" to append to the canvas.
+5. CODE EXECUTION: after writing a .js file, run it with "executions" and quote the returned output exactly — never claim a run result you did not see in the log.`;
     const userPrompt = `${vizSummary}
 
 FULL AGENT ROSTER & LIVE METRICS:
@@ -19819,7 +19954,7 @@ ${recentChat || "(No chat history yet)"}
 CURRENT IMMUTABLE CANVAS CHRONICLE:
 ${currentCanvas || "(Canvas chronicle is empty - initiate sector foundation)"}
 
-Respond in JSON matching the schema (thoughts, action, message, updated_canvas, file_operations, confidence).`;
+Respond in JSON matching the schema (thoughts, action, message, updated_canvas, file_operations, executions, confidence).`;
     const payload = config.buildPayload(systemPrompt, userPrompt, temperature, apiModel);
     const headers = { "Content-Type": "application/json" };
     let retries = 5;
@@ -19896,6 +20031,10 @@ Respond in JSON matching the schema (thoughts, action, message, updated_canvas, 
         if (result.file_operations && Array.isArray(result.file_operations) && result.file_operations.length > 0) {
           fileOpLogs = await executeFileOperations(agent.name, result.file_operations);
         }
+        let execLogs = [];
+        if (result.executions && Array.isArray(result.executions) && result.executions.length > 0) {
+          execLogs = await executeCodeExecutions(agent.name, result.executions);
+        }
         setAgents((prev) => prev.map((a) => {
           if (a.id !== agent.id)
             return a;
@@ -19921,6 +20060,10 @@ Respond in JSON matching the schema (thoughts, action, message, updated_canvas, 
 
 \uD83D\uDCC1 **Workspace Filesystem Operations:**
 ${fileOpLogs.join(`
+`)}` : "") + (execLogs.length > 0 ? `
+
+⚙️ **Code Execution:**
+${execLogs.join(`
 `)}` : ""),
           action: result.action,
           thoughts: result.thoughts,
@@ -20557,6 +20700,12 @@ ${fileOpLogs.join(`
                                 title: "Export Single",
                                 children: /* @__PURE__ */ jsx_dev_runtime.jsxDEV(Icons.FileDown, {}, undefined, false, undefined, this)
                               }, undefined, false, undefined, this),
+                              file.path.endsWith(".js") && /* @__PURE__ */ jsx_dev_runtime.jsxDEV("button", {
+                                onClick: () => handleRunVFSFile(file.path),
+                                style: { border: "none", background: "transparent", color: "#4ade80", cursor: "pointer", padding: "2px" },
+                                title: "Run",
+                                children: /* @__PURE__ */ jsx_dev_runtime.jsxDEV(Icons.Play, {}, undefined, false, undefined, this)
+                              }, undefined, false, undefined, this),
                               /* @__PURE__ */ jsx_dev_runtime.jsxDEV("button", {
                                 onClick: () => handleDeleteVFSFile(file.path),
                                 style: { border: "none", background: "transparent", color: "#f87171", cursor: "pointer", padding: "2px" },
@@ -20582,11 +20731,21 @@ ${fileOpLogs.join(`
                           style: { fontSize: "13px", fontFamily: "monospace", color: "#60a5fa", fontWeight: 600 },
                           children: selectedFilePath
                         }, undefined, false, undefined, this),
-                        /* @__PURE__ */ jsx_dev_runtime.jsxDEV("button", {
-                          onClick: handleSaveVFSFile,
-                          style: styles.btnPrimary,
-                          children: "Save File"
-                        }, undefined, false, undefined, this)
+                        /* @__PURE__ */ jsx_dev_runtime.jsxDEV("div", {
+                          style: { display: "flex", gap: "8px" },
+                          children: [
+                            selectedFilePath.endsWith(".js") && /* @__PURE__ */ jsx_dev_runtime.jsxDEV("button", {
+                              onClick: () => handleRunVFSFile(selectedFilePath),
+                              style: styles.btnSecondary,
+                              children: "▶ Run"
+                            }, undefined, false, undefined, this),
+                            /* @__PURE__ */ jsx_dev_runtime.jsxDEV("button", {
+                              onClick: handleSaveVFSFile,
+                              style: styles.btnPrimary,
+                              children: "Save File"
+                            }, undefined, false, undefined, this)
+                          ]
+                        }, undefined, true, undefined, this)
                       ]
                     }, undefined, true, undefined, this),
                     /* @__PURE__ */ jsx_dev_runtime.jsxDEV("textarea", {
@@ -20606,7 +20765,20 @@ ${fileOpLogs.join(`
                         outline: "none"
                       },
                       spellCheck: false
-                    }, undefined, false, undefined, this)
+                    }, undefined, false, undefined, this),
+                    runOutput && /* @__PURE__ */ jsx_dev_runtime.jsxDEV("div", {
+                      style: { maxHeight: "180px", overflowY: "auto", background: "#05070c", borderTop: "1px solid #1f2937", padding: "12px 16px" },
+                      children: [
+                        /* @__PURE__ */ jsx_dev_runtime.jsxDEV("div", {
+                          style: { fontSize: "11px", color: "#6b7280", marginBottom: "6px", fontFamily: "monospace" },
+                          children: "▶ RUN OUTPUT"
+                        }, undefined, false, undefined, this),
+                        /* @__PURE__ */ jsx_dev_runtime.jsxDEV("pre", {
+                          style: { margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: "12px", color: "#a7f3d0", fontFamily: "'JetBrains Mono', 'Fira Code', monospace" },
+                          children: runOutput
+                        }, undefined, false, undefined, this)
+                      ]
+                    }, undefined, true, undefined, this)
                   ]
                 }, undefined, true, undefined, this) : /* @__PURE__ */ jsx_dev_runtime.jsxDEV("div", {
                   style: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#374151", flexDirection: "column", gap: "8px" },
